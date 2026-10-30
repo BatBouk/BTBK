@@ -1,7 +1,8 @@
 /* CleanFrame service for TizenBrew.
    Runs inside TizenBrew's Node service (old Node: ES5 only, built-in modules only).
-   Listens on 127.0.0.1 only and relays two things to the TV's own local app API
-   (127.0.0.1:8001): "which of these apps are installed" and "launch this app".
+   Listens on 127.0.0.1 only. To list and open apps it first tries the Tizen application API
+   (available to the service process on many TVs), then falls back to the TV's local app API
+   (127.0.0.1:8001), which some firmwares protect with HTTP 401.
    No network access beyond the TV itself, no files written, no credentials. */
 (function () {
   'use strict';
@@ -12,6 +13,7 @@
   var tvTarget = String(process.env.CLEANFRAME_TV_API || '127.0.0.1:8001').split(':');
   var TV_HOST = tvTarget[0];
   var TV_PORT = Number(tvTarget[1]) || 8001;
+  var TIZEN_TIMEOUT = 6000;
 
   var ORIGINS = { 'http://127.0.0.1:8081': 1, 'http://localhost:8081': 1 };
   if (process.env.CLEANFRAME_TEST_ORIGIN) ORIGINS[process.env.CLEANFRAME_TEST_ORIGIN] = 1;
@@ -30,7 +32,40 @@
     { brand: 'tubi', name: 'Tubi', ids: ['3KA0pm7a7V.TubiTV'] }
   ];
   var ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+  var STORE_ID = /^[A-Za-z0-9]{10}\.[A-Za-z0-9_-]+$/;
+  var HIDE_NAME = /(?:service|worker|preview|promotion|plugin|launcher|test|sdk|^ep[ -]|factory|daemon|tizenbrew)/i;
+  var HIDE_ID = ['adplatform.ADPlayer', 'WykOS4t4F0.cmsWebApp', '25emanual3.emanual', 'd0m1lV1nt2.emanual', '2022ePop01.SmartTV',
+    'ZODRT12q2l.WebAccountExtension', 'ByJlgt0XeD.CastSettingsApp', 'tv6pbVMQFF.PrivacyChoices'];
 
+  /* ---------- Tizen application API (when the service process has it) ---------- */
+  function tizenApp() {
+    try { if (typeof tizen !== 'undefined' && tizen && tizen.application) return tizen.application; } catch (e) { }
+    return null;
+  }
+  function errName(e) {
+    if (e && e.name && e.name !== 'Error') return String(e.name);
+    return e && e.message ? String(e.message) : 'error';
+  }
+
+  function tizenLaunch(id, done) {
+    var api = tizenApp(), finished = false, timer;
+    function finish(err) { if (finished) return; finished = true; clearTimeout(timer); done(err); }
+    if (!api || typeof api.launch !== 'function') { done(new Error('no-tizen-api')); return; }
+    timer = setTimeout(function () { finish(new Error('timeout')); }, TIZEN_TIMEOUT);
+    try { api.launch(id, function () { finish(null); }, function (e) { finish(e || new Error('error')); }); }
+    catch (e) { finish(e); }
+  }
+
+  function tizenApps(done) {
+    var api = tizenApp(), finished = false, timer;
+    function finish(list) { if (finished) return; finished = true; clearTimeout(timer); done(list); }
+    if (!api || typeof api.getAppsInfo !== 'function') { done(null); return; }
+    timer = setTimeout(function () { finish(null); }, 10000);
+    try { api.getAppsInfo(function (list) { finish(list || []); }, function () { finish(null); }); }
+    catch (e) { finish(null); }
+  }
+
+  /* ---------- TV local REST API (fallback) ---------- */
   function tvRequest(method, id, timeout, done) {
     var finished = false, req;
     function finish(err, res) { if (finished) return; finished = true; done(err, res); }
@@ -60,7 +95,7 @@
     });
   }
 
-  function findInstalled(group, done) {
+  function restFindInstalled(group, done) {
     var i = 0;
     (function step() {
       if (i >= group.ids.length) { done(null); return; }
@@ -71,13 +106,37 @@
     }());
   }
 
-  function listApps(done) {
+  function restListApps(done) {
     var out = [], pending = GROUPS.length;
     GROUPS.forEach(function (group, idx) {
-      findInstalled(group, function (found) {
+      restFindInstalled(group, function (found) {
         if (found) out[idx] = found;
         if (--pending === 0) done(out.filter(Boolean));
       });
+    });
+  }
+
+  /* ---------- Apps ---------- */
+  function listApps(done) {
+    tizenApps(function (list) {
+      var byId = {}, out = [], extras = [];
+      if (!list) { restListApps(done); return; }
+      list.forEach(function (a) { if (a && typeof a.id === 'string') byId[a.id] = a; });
+      GROUPS.forEach(function (group) {
+        var i, id;
+        for (i = 0; i < group.ids.length; i++) {
+          id = group.ids[i];
+          if (byId[id]) { out.push({ appId: id, name: group.name, brand: group.brand }); return; }
+        }
+      });
+      list.forEach(function (a) {
+        var known = GROUPS.some(function (g) { return g.ids.indexOf(a.id) >= 0; });
+        if (!a || known || typeof a.id !== 'string' || typeof a.name !== 'string' || !a.name) return;
+        if (!a.show || !STORE_ID.test(a.id) || HIDE_ID.indexOf(a.id) >= 0 || HIDE_NAME.test(a.name + ' ' + a.id) || /-dummy$/.test(a.id)) return;
+        extras.push({ appId: a.id, name: a.name.slice(0, 80), brand: '' });
+      });
+      extras.sort(function (x, y) { return x.name.toLowerCase() < y.name.toLowerCase() ? -1 : 1; });
+      done(out.concat(extras.slice(0, 30)));
     });
   }
 
@@ -93,18 +152,39 @@
   }
 
   function launch(id, done) {
-    var list = candidatesFor(id), i = 0, last = 'no answer';
+    var list = candidatesFor(id), i = 0, notes = [];
     (function step() {
-      if (i >= list.length) { done({ message: 'The TV could not open this app.', detail: 'Not found or refused (' + last + '). Tried: ' + list.join(', ') }); return; }
-      var current = list[i++];
-      tvRequest('POST', current, 8000, function (err, res) {
-        if (!err && res && res.status >= 200 && res.status < 300) { done(null, { ok: true, appId: current }); return; }
-        last = err ? String(err.message || err) : 'HTTP ' + res.status;
-        step();
+      var current;
+      if (i >= list.length) {
+        done({ message: 'The TV could not open this app.', detail: 'Tried ' + notes.join(' | ') });
+        return;
+      }
+      current = list[i++];
+      tizenLaunch(current, function (terr) {
+        if (!terr) { done(null, { ok: true, appId: current, via: 'tizen' }); return; }
+        tvRequest('POST', current, 8000, function (err, res) {
+          if (!err && res && res.status >= 200 && res.status < 300) { done(null, { ok: true, appId: current, via: 'rest' }); return; }
+          notes.push(current + ' [tizen:' + errName(terr) + ', rest:' + (err ? errName(err) : 'HTTP ' + res.status) + ']');
+          step();
+        });
       });
     }());
   }
 
+  function diag(done) {
+    var api = tizenApp();
+    var info = {
+      node: process.version,
+      uid: typeof process.getuid === 'function' ? process.getuid() : null,
+      tizen: !!api, launch: !!(api && typeof api.launch === 'function'), getAppsInfo: !!(api && typeof api.getAppsInfo === 'function')
+    };
+    tvRequest('GET', 'org.tizen.netflix-app', 3000, function (err, res) {
+      info.rest = err ? errName(err) : 'HTTP ' + res.status;
+      done(info);
+    });
+  }
+
+  /* ---------- HTTP server (127.0.0.1 only) ---------- */
   function send(res, status, data, origin) {
     var body = JSON.stringify(data);
     var headers = { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', 'Content-Length': Buffer.byteLength(body) };
@@ -127,6 +207,7 @@
       return;
     }
     if (req.method === 'GET' && url === '/v1/ping') { send(res, 200, { ok: true, module: 'cleanframe-tizenbrew' }, allowedOrigin); return; }
+    if (req.method === 'GET' && url === '/v1/diag') { diag(function (info) { send(res, 200, info, allowedOrigin); }); return; }
     if (req.method === 'GET' && url === '/v1/apps') {
       listApps(function (apps) { send(res, 200, { apps: apps }, allowedOrigin); });
       return;
