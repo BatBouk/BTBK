@@ -1,0 +1,13 @@
+{
+  "name": "cleanframe-tizenbrew",
+  "version": "0.1.0",
+  "description": "CleanFrame home screen as a TizenBrew app module (adapted from nthnclrk/CleanFrame).",
+  "packageType": "app",
+  "appName": "CleanFrame",
+  "appPath": "app/index.html",
+  "serviceFile": "service/service.js",
+  "keys": [],
+  "license": "MIT",
+  "keywords": ["tizenbrew", "tizen", "samsung-tv", "launcher"],
+  "files": ["app", "service", "README.md", "LICENSE", "THIRD_PARTY_NOTICES.md"]
+}
